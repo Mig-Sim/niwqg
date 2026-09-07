@@ -1,6 +1,6 @@
 import numpy as np
 import scipy.special as special
-
+import cupy as cp
 def McWilliams1984(model,k0=6,E=0.5):
 
     """ Generate random vorticity field with red spectrum given in
@@ -24,19 +24,35 @@ def McWilliams1984(model,k0=6,E=0.5):
 
     """
 
-    ckappa = np.zeros_like(model.wv2)
-    nhx,nhy = model.wv2.shape
-    kc2 = k0**2
+    if model.use_cuda:
+        ckappa = cp.zeros_like(model.wv2)
+        nhx,nhy = model.wv2.shape
+        kc2 = k0**2
 
-    fk = model.wv != 0
-    ckappa[fk] = np.sqrt( model.wv2[fk]*(1. + (model.wv2[fk]/kc2)**2) )**-1
+        fk = model.wv != 0
+        ckappa[fk] = cp.sqrt( model.wv2[fk]*(1. + (model.wv2[fk]/kc2)**2) )**-1
 
-    phase = np.random.rand(nhx,nhy)*2*np.pi
-    ph = ckappa*np.cos(phase) + 1j*ckappa*np.sin(phase)
-    ph = model.fft(model.ifft(ph).real)
-    Eaux = 0.5*model.spec_var( model.wv*ph )
-    pih = np.sqrt(E/Eaux)*ph
-    qih = -model.wv2*pih
+        phase = cp.random.rand(nhx,nhy)*2*cp.pi
+        ph = ckappa*cp.cos(phase) + 1j*ckappa*cp.sin(phase)
+        ph = model.fft(model.ifft(ph).real)
+        Eaux = 0.5*model.spec_var( model.wv*ph )
+        pih = cp.sqrt(E/Eaux)*ph
+        qih = -model.wv2*pih
+
+    else:
+        ckappa = np.zeros_like(model.wv2)
+        nhx,nhy = model.wv2.shape
+        kc2 = k0**2
+
+        fk = model.wv != 0
+        ckappa[fk] = np.sqrt( model.wv2[fk]*(1. + (model.wv2[fk]/kc2)**2) )**-1
+
+        phase = np.random.rand(nhx,nhy)*2*np.pi
+        ph = ckappa*np.cos(phase) + 1j*ckappa*np.sin(phase)
+        ph = model.fft(model.ifft(ph).real)
+        Eaux = 0.5*model.spec_var( model.wv*ph )
+        pih = np.sqrt(E/Eaux)*ph
+        qih = -model.wv2*pih
 
     return model.ifft(qih).real
 
@@ -58,19 +74,35 @@ def Danioux2015(model,k0=6,E=0.5):
             Vorticity (physical space).
 
                                                                              """
-    ckappa = np.zeros_like(model.wv2)
-    nhx,nhy = model.wv2.shape
-    kc2 = k0**2
+    if model.use_cuda:
+        ckappa = cp.zeros_like(model.wv2)
+        nhx,nhy = model.wv2.shape
+        kc2 = k0**2
 
-    fk = model.wv != 0
-    ckappa[fk] = np.sqrt( model.wv[fk]*np.exp(-(model.wv2[fk]/kc2 )))
+        fk = model.wv != 0
+        ckappa[fk] = cp.sqrt( model.wv[fk]*cp.exp(-(model.wv2[fk]/kc2 )))
 
-    phase = np.random.rand(nhx,nhy)*2*np.pi
-    ph = ckappa*np.cos(phase) + 1j*ckappa*np.sin(phase)
-    ph = model.fft(model.ifft(ph).real)
-    Eaux = 0.5*model.spec_var( model.wv*ph )
-    pih = np.sqrt(E/Eaux)*ph
-    qih = -model.wv2*pih
+        phase = cp.random.rand(nhx,nhy)*2*cp.pi
+        ph = ckappa*cp.cos(phase) + 1j*ckappa*cp.sin(phase)
+        ph = model.fft(model.ifft(ph).real)
+        Eaux = 0.5*model.spec_var( model.wv*ph )
+        pih = cp.sqrt(E/Eaux)*ph
+        qih = -model.wv2*pih
+
+    else:
+        ckappa = np.zeros_like(model.wv2)
+        nhx,nhy = model.wv2.shape
+        kc2 = k0**2
+
+        fk = model.wv != 0
+        ckappa[fk] = np.sqrt( model.wv[fk]*np.exp(-(model.wv2[fk]/kc2 )))
+
+        phase = np.random.rand(nhx,nhy)*2*np.pi
+        ph = ckappa*np.cos(phase) + 1j*ckappa*np.sin(phase)
+        ph = model.fft(model.ifft(ph).real)
+        Eaux = 0.5*model.spec_var( model.wv*ph )
+        pih = np.sqrt(E/Eaux)*ph
+        qih = -model.wv2*pih
 
     return model.ifft(qih).real
 
@@ -92,24 +124,46 @@ def LambDipole(model, U=.01,R = 1.):
 
     """
 
-    N = model.nx
-    x, y = model.x, model.y
-    x0,y0 = x[N//2,N//2],y[N//2,N//2]
+    if model.use_cuda:
+        N = model.nx
+        x, y = model.x, model.y
+        x0,y0 = x[N//2,N//2],y[N//2,N//2]
 
-    r = np.sqrt( (x-x0)**2 + (y-y0)**2 )
-    s = np.zeros_like(r)
+        r = cp.sqrt( (x-x0)**2 + (y-y0)**2 )
+        s = cp.zeros_like(r)
 
-    for i in range(N):
-        for j in range(N):
-            if r[i,j] == 0.:
-                s[i,j] = 0.
-            else:
-                s[i,j] = (y[i,j]-y0)/r[i,j]
+        for i in range(N):
+            for j in range(N):
+                if r[i,j] == 0.:
+                    s[i,j] = 0.
+                else:
+                    s[i,j] = (y[i,j]-y0)/r[i,j]
 
-    lam = (3.8317)/R
-    C = -(2.*U*lam)/(special.j0(lam*R))
-    q = np.zeros_like(r)
-    q[r<=R] = C*special.j1(lam*r[r<=R])*s[r<=R]
+        lam = (3.8317)/R
+        C = -(2.*U*lam)/(special.j0(lam*R))
+        q = cp.zeros_like(r)
+        q[r<=R] = C*special.j1(lam*r[r<=R])*s[r<=R]
+
+    else:
+
+        N = model.nx
+        x, y = model.x, model.y
+        x0,y0 = x[N//2,N//2],y[N//2,N//2]
+
+        r = np.sqrt( (x-x0)**2 + (y-y0)**2 )
+        s = np.zeros_like(r)
+
+        for i in range(N):
+            for j in range(N):
+                if r[i,j] == 0.:
+                    s[i,j] = 0.
+                else:
+                    s[i,j] = (y[i,j]-y0)/r[i,j]
+
+        lam = (3.8317)/R
+        C = -(2.*U*lam)/(special.j0(lam*R))
+        q = np.zeros_like(r)
+        q[r<=R] = C*special.j1(lam*r[r<=R])*s[r<=R]
 
     return q
 
@@ -134,13 +188,22 @@ def WavePacket(model, k=10, l=0, R = 1,x0=0.,y0=0.):
 
     """
 
-    N = model.nx
-    x, y = model.x, model.y
+    if model.use_cuda:
+        N = model.nx
+        x, y = model.x, model.y
 
-    r = np.sqrt( (x-x0)**2 + (y-y0)**2 )
+        r = cp.sqrt( (x-x0)**2 + (y-y0)**2 )
 
-    phi = np.exp(1j*(k*(x-x0)+l*(y-y0)))
-    phi *= np.exp(-((r/R)**2))
+        phi = cp.exp(1j*(k*(x-x0)+l*(y-y0)))
+        phi *= cp.exp(-((r/R)**2))
+    else:
+        N = model.nx
+        x, y = model.x, model.y
+
+        r = np.sqrt( (x-x0)**2 + (y-y0)**2 )
+
+        phi = np.exp(1j*(k*(x-x0)+l*(y-y0)))
+        phi *= np.exp(-((r/R)**2))
 
     return phi
 
@@ -164,6 +227,10 @@ def PlaneWave(model, k=10,l=0,phase=0.):
 
     """
 
-    phi = np.exp(1j*(k*model.x+l*model.y)+phase)
+    if model.use_cuda:
+        phi = cp.exp(1j*(k*model.x+l*model.y)+phase)
+    else:
+        phi = np.exp(1j*(k*model.x+l*model.y)+phase)
+
 
     return phi

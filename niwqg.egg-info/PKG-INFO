@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: niwqg
+Version: 0.1b0
+Home-page: http://github.com/crocha700/niwqg
+License: MIT
+License-File: LICENSE
+Requires-Dist: numpy
+Requires-Dist: h5py
+Dynamic: home-page
+Dynamic: license
+Dynamic: license-file
+Dynamic: requires-dist

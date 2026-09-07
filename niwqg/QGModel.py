@@ -78,6 +78,10 @@ class Model(object):
         mu = 0,
         beta = 0,
         passive_scalar = False,
+        forcing = False,
+        sigma_q = 0,
+        wavenumber_forcing = 25,
+        width_forcing = 2,
         nu4c = 5.e9,
         nuc = 0,
         muc = 0,
@@ -112,6 +116,11 @@ class Model(object):
         self.nuc = nuc
         self.muc = muc
 
+        self.forcing = forcing
+        self.sigma_q =  sigma_q
+        self.wavenumber_forcing = wavenumber_forcing
+        self.width_forcing = width_forcing
+
         self.save_to_disk = save_to_disk
         self.overwrite = overwrite
         self.tsnaps = tsave_snapshots
@@ -128,6 +137,7 @@ class Model(object):
         self._initialize_filter()
         self._initialize_etdrk4()
         self._initialize_time()
+        self._initialize_forcing()
 
         initialize_save_snapshots(self, self.path)
         save_setup(self, )
@@ -277,8 +287,37 @@ class Model(object):
             'needs to be implemented by Model subclass')
 
     def _initialize_forcing(self):
-        raise NotImplementedError(
-            'needs to be implemented by Model subclass')
+
+        """ Sets up the spectrum of the stochastic forcing """
+
+        # See appendix A of Navid Constantinou's dissertation
+        # amplitude_forcing = sqrt(energy input)
+
+        # the spectrum of the forcing (this is Navid's Qkl);
+        self.spectrum_forcing = np.exp(-((self.wv-self.wavenumber_forcing)**2) / (2*(self.width_forcing**2)) )
+
+        # Normalize such that the equivalent kinetic energy spectrum integrates to one
+        norm = self.spec_var( np.sqrt(self.spectrum_forcing*self.wv2i/2) )
+        self.spectrum_forcing *= 1./norm
+
+        # self.spectrum_forcing = np.exp(-(self.wv - self.wavenumber_forcing)**2/(2*self.width_forcing**2))
+        # norm = 2*np.sum(self.spectrum_forcing*self.wv2i/2)
+        # self.spectrum_forcing = self.spectrum_forcing/norm
+
+
+    def _update_qg_forcing(self):
+
+        """ Updates the forcing (delta-correlated in time) """
+
+        phase = np.random.rand(self.nl,self.nk)*2*np.pi
+        fh = self.sigma_q*np.sqrt(self.spectrum_forcing)*np.exp(1j*phase)
+        self.force = self.ifft(fh)
+        return self.fft(self.force)
+
+        # eta = (np.random.randn(self.nl, self.nk) + 1j*np.random.randn(self.nl, self.nk))/np.sqrt(2)
+        # fh = self.M*np.sqrt(self.epsilon_q*self.spectrum_forcing)*eta
+        # return fh
+
 
     def _initialize_filter(self):
 
@@ -298,10 +337,6 @@ class Model(object):
         else:
             self.filtr = np.ones_like(self.wv2)
             self.logger.info(' No dealiasing; no filter')
-
-
-    def _do_external_forcing(self):
-        pass
 
     def _initialize_logger(self):
 
@@ -327,7 +362,7 @@ class Model(object):
 
     def _step_etdrk4(self):
 
-        """ Take one step forward using an exponential time-dfferencing method
+        """ Take one step forward using an exponential time-differencing method
             with a Runge-Kutta 4 scheme.
 
             Rereferences
@@ -337,8 +372,13 @@ class Model(object):
 
         """
 
+        self.forceh = self._update_qg_forcing()
+        #self.force = self.ifft(self.forceh)
+        # self.qh += self.dt*(-self.jacobian_psi_q() + self.forceh/np.sqrt(self.dt)-self.mu*self.qh)
+        # self._invert()
+
         self.qh0 = self.qh.copy()
-        Fn0 = -self.jacobian_psi_q()
+        Fn0 = -self.jacobian_psi_q() + self.forceh/np.sqrt(self.dt)
         self.qh = (self.expch_h*self.qh0 + Fn0*self.Qh)*self.filtr
         self.qh1 = self.qh.copy()
 
@@ -351,10 +391,14 @@ class Model(object):
             self._calc_derived_fields()
             c1 = self._calc_ep_c()
 
+        w1 =  -(self.p*self.force).mean()/np.sqrt(self.dt)
+
         self._invert()
+
         k1 = self._calc_ep_psi()
 
-        Fna = -self.jacobian_psi_q()
+
+        Fna = -self.jacobian_psi_q()+self.forceh/np.sqrt(self.dt)
         self.qh = (self.expch_h*self.qh0 + Fna*self.Qh)*self.filtr
 
         if self.passive_scalar:
@@ -364,10 +408,11 @@ class Model(object):
             self._calc_derived_fields()
             c2 = self._calc_ep_c()
 
+        w2 =  -(self.p*self.force).mean()/np.sqrt(self.dt)
         self._invert()
         k2 = self._calc_ep_psi()
 
-        Fnb = -self.jacobian_psi_q()
+        Fnb = -self.jacobian_psi_q()+self.forceh/np.sqrt(self.dt)
         self.qh = (self.expch_h*self.qh1 + ( 2.*Fnb - Fn0 )*self.Qh)*self.filtr
 
         if self.passive_scalar:
@@ -377,10 +422,13 @@ class Model(object):
             self._calc_derived_fields()
             c3 = self._calc_ep_c()
 
+        w3 =  -(self.p*self.force).mean()/np.sqrt(self.dt)
+
         self._invert()
         k3 = self._calc_ep_psi()
 
-        Fnc = -self.jacobian_psi_q()
+        Fnc = -self.jacobian_psi_q()+self.forceh/np.sqrt(self.dt)
+
         self.qh = (self.expch*self.qh0 + Fn0*self.f0 +  2.*(Fna+Fnb)*self.fab\
                   + Fnc*self.fc)*self.filtr
 
@@ -393,9 +441,11 @@ class Model(object):
             c4 = self._calc_ep_c()
             self.cvar += self.dt*(c1 + 2*(c2+c3) + c4)/6.
 
+        w4 =  -(self.p*self.force).mean()/np.sqrt(self.dt)
 
         # invert
         self._invert()
+        k4 = self._calc_ep_psi()
 
         # calcuate q
         self.q = self.ifft(self.qh).real
@@ -403,8 +453,9 @@ class Model(object):
         if self.passive_scalar:
             self.c = self.ifft(self.ch).real
 
-        k4 = self._calc_ep_psi()
         self.Ke += self.dt*(k1 + 2*(k2+k3) + k4)/6.
+        self.Work += self.dt*(w1 + 2*(w2+w3) + w4)/6.
+        self.Work2 += -np.sqrt(self.dt)*(self.p*self.ifft(self.forceh)).mean()
 
 
     def _initialize_etdrk4(self):
@@ -518,6 +569,8 @@ class Model(object):
         self.qh = self.fft(self.q)
         self._invert()
         self.Ke = self._calc_ke_qg()
+        self.Work = 0.
+        self.Work2 = 0.
 
     def set_c(self,c):
 
@@ -537,7 +590,7 @@ class Model(object):
 
         """ Define the two-dimensional FFT methods.
         """
-        
+
         # need to fix bug in mkl_fft.irfft2
         if self.use_mkl:
             #import mkl
@@ -658,11 +711,32 @@ class Model(object):
                 function = (lambda self: self.Ke)
         )
 
+        add_diagnostic(self, 'Work',
+                description='Work by stochastic forcing, from work equation',
+                units=r'm^2 s^{-2}',
+                types = 'scalar',
+                function = (lambda self: self.Work)
+        )
+
+        add_diagnostic(self, 'Work2',
+                description='Work by stochastic forcing, from work equation using Euler',
+                units=r'm^2 s^{-2}',
+                types = 'scalar',
+                function = (lambda self: self.Work2 )
+        )
+
         add_diagnostic(self,'ens',
                 description='Quasigeostrophic Potential Enstrophy',
                 units=r's^{-2}',
                 types = 'scalar',
                 function = (lambda self: 0.5*(self.q**2).mean())
+        )
+
+        add_diagnostic(self,'energy_input',
+                description='Energy input by random forcing',
+                units=r'$m^2 s^{-3}$',
+                types = 'scalar',
+                function = (lambda self: -(self.p*self.ifft(self.forceh)).mean()/np.sqrt(self.dt))
         )
 
         add_diagnostic(self, 'ep_psi',

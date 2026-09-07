@@ -46,6 +46,8 @@ def increment_diagnostics(self):
         for dname in self.diagnostics:
             res = self.diagnostics[dname]['function'](self)
             try:
+                if self.use_cuda and hasattr(res, 'get'):
+                    res = res.get()
                 if self.diagnostics[dname]['type'] == 'scalar':
                     self.diagnostics[dname]['value'] = np.hstack([ self.diagnostics[dname]['value'],res])
                 else:

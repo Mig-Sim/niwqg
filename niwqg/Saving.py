@@ -2,7 +2,7 @@
 
 import os
 import h5py
-
+import cupy as cp
 def initialize_save_snapshots(self,path):
 
     """ Initializes class variables for saving snapshots.
@@ -45,14 +45,27 @@ def save_setup(self,):
         fno = self.fno + '/setup.h5'
 
         file_exist(fno,overwrite=self.overwrite)
+        if self.use_cuda:
+            import cupy as cp
 
+            x = cp.asnumpy(self.x)
+            y = cp.asnumpy(self.y)
+            wv = cp.asnumpy(self.wv)
+            kk = cp.asnumpy(self.kk)
+            ll = cp.asnumpy(self.ll)
+        else:
+            x = self.x
+            y = self.y
+            wv = self.wv
+            kk = self.kk
+            ll = self.ll
         h5file = h5py.File(fno, 'w')
         h5file.create_dataset("grid/nx", data=(self.nx),dtype=int)
-        h5file.create_dataset("grid/x", data=(self.x))
-        h5file.create_dataset("grid/y", data=(self.y))
-        h5file.create_dataset("grid/wv", data=self.wv)
-        h5file.create_dataset("grid/k", data=self.kk)
-        h5file.create_dataset("grid/l", data=self.ll)
+        h5file.create_dataset("grid/x", data=(x))
+        h5file.create_dataset("grid/y", data=(y))
+        h5file.create_dataset("grid/wv", data=(wv))
+        h5file.create_dataset("grid/k", data=(kk))
+        h5file.create_dataset("grid/l", data=(ll))
         # h5file.create_dataset("constants/f0", data=(self.f))
         h5file.close()
 
@@ -77,9 +90,13 @@ def save_snapshots(self, fields=['t','q','p']):
 
         for field in fields:
             if field == 't':
-                h5file.create_dataset(field, data=(self.t))
+                data = self.t
+                h5file.create_dataset(field, data=data)
             else:
-                h5file.create_dataset(field, data=eval("self."+field))
+                data = getattr(self, field)
+                if self.use_cuda:
+                    data = cp.asnumpy(data)
+                h5file.create_dataset(field, data=data)
 
         h5file.close()
     else:
@@ -96,6 +113,12 @@ def save_diagnostics(self):
     h5file = h5py.File(fno, 'w')
 
     for key in self.diagnostics.keys():
-        h5file.create_dataset(key, data=(self.diagnostics[key]['value']))
+
+        data = self.diagnostics[key]['value']
+
+        if self.use_cuda and isinstance(data, cp.ndarray):
+            data = cp.asnumpy(data)
+
+        h5file.create_dataset(key, data=data)
 
     h5file.close()

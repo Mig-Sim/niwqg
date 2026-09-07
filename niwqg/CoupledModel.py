@@ -1,6 +1,8 @@
 import numpy as np
 from . import Kernel
 from .Diagnostics import *
+import cupy as cp
+
 
 class Model(Kernel.Kernel):
 
@@ -34,25 +36,44 @@ class Model(Kernel.Kernel):
 
         """ Allocate variables so that variable addresses are close in memory.
         """
+        if self.use_cuda:
+            self.dtype_real = cp.dtype('float64')
+            self.dtype_cplx = cp.dtype('complex128')
+            self.shape_real = (self.ny, self.nx)
+            self.shape_cplx = (self.ny, self.nx)
 
-        self.dtype_real = np.dtype('float64')
-        self.dtype_cplx = np.dtype('complex128')
-        self.shape_real = (self.ny, self.nx)
-        self.shape_cplx = (self.ny, self.nx)
+            # vorticity
+            self.q  = cp.zeros(self.shape_real,  self.dtype_real)
+            self.qh = cp.zeros(self.shape_cplx,  self.dtype_cplx)
+            self.qh0 = cp.zeros(self.shape_cplx, self.dtype_cplx)
+            self.qh1 = cp.zeros(self.shape_cplx, self.dtype_cplx)
 
-        # vorticity
-        self.q  = np.zeros(self.shape_real,  self.dtype_real)
-        self.qh = np.zeros(self.shape_cplx,  self.dtype_cplx)
-        self.qh0 = np.zeros(self.shape_cplx, self.dtype_cplx)
-        self.qh1 = np.zeros(self.shape_cplx, self.dtype_cplx)
+            # stream function
+            self.p  = cp.zeros(self.shape_real,  self.dtype_real)
+            self.ph = cp.zeros(self.shape_cplx,  self.dtype_cplx)
 
-        # stream function
-        self.p  = np.zeros(self.shape_real,  self.dtype_real)
-        self.ph = np.zeros(self.shape_cplx,  self.dtype_cplx)
+            # wave amplitude
+            self.phi = cp.zeros(self.shape_real,  self.dtype_cplx)
+            self.phih = cp.zeros(self.shape_cplx,  self.dtype_cplx)
+        else:
+            self.dtype_real = np.dtype('float64')
+            self.dtype_cplx = np.dtype('complex128')
+            self.shape_real = (self.ny, self.nx)
+            self.shape_cplx = (self.ny, self.nx)
 
-        # wave amplitude
-        self.phi = np.zeros(self.shape_real,  self.dtype_cplx)
-        self.phih = np.zeros(self.shape_cplx,  self.dtype_cplx)
+            # vorticity
+            self.q  = np.zeros(self.shape_real,  self.dtype_real)
+            self.qh = np.zeros(self.shape_cplx,  self.dtype_cplx)
+            self.qh0 = np.zeros(self.shape_cplx, self.dtype_cplx)
+            self.qh1 = np.zeros(self.shape_cplx, self.dtype_cplx)
+
+            # stream function
+            self.p  = np.zeros(self.shape_real,  self.dtype_real)
+            self.ph = np.zeros(self.shape_cplx,  self.dtype_cplx)
+
+            # wave amplitude
+            self.phi = np.zeros(self.shape_real,  self.dtype_cplx)
+            self.phih = np.zeros(self.shape_cplx,  self.dtype_cplx)
 
 
 
@@ -66,11 +87,17 @@ class Model(Kernel.Kernel):
         complex array of floats
             The Fourier transform of Jacobian(conj(phi),phi)
         """
+        if self.use_cuda:
+            self.phix, self.phiy = self.ifft(self.ik*self.phih), self.ifft(self.il*self.phih)
+            jach = self.fft((1j*(cp.conj(self.phix)*self.phiy - cp.conj(self.phiy)*self.phix)).real)
+            jach[0,0] = 0
+            return jach
+        else:
+            self.phix, self.phiy = self.ifft(self.ik*self.phih), self.ifft(self.il*self.phih)
+            jach = self.fft((1j*(np.conj(self.phix)*self.phiy - np.conj(self.phiy)*self.phix)).real)
+            jach[0,0] = 0
+            return jach
 
-        self.phix, self.phiy = self.ifft(self.ik*self.phih), self.ifft(self.il*self.phih)
-        jach = self.fft((1j*(np.conj(self.phix)*self.phiy - np.conj(self.phiy)*self.phix)).real)
-        jach[0,0] = 0
-        return jach
 
     def _invert(self):
 
@@ -81,20 +108,40 @@ class Model(Kernel.Kernel):
                 3) Calculate geostrophic stremfunction, p = pv+pw.
         """
 
-        # the wavy PV
-        self.phi2 = np.abs(self.phi)**2
-        self.gphi2h = -self.wv2*self.fft(self.phi2)
-        self.qwh = 0.5*(0.5*self.gphi2h  + self.jacobian_phic_phi())/self.f
-        self.qwh *= self.filtr
+        # the wave PV
+        if self.use_cuda:
+            self.phi2 = cp.abs(self.phi)**2
+            self.gphi2h = -self.wv2*self.fft(self.phi2)
+            self.qwh = 0.5*(0.5*self.gphi2h  + self.jacobian_phic_phi())/self.f
+            self.qwh *= self.filtr
 
-        # invert for psi
-        self.pw = self.ifft((self.wv2i*self.qwh)).real
-        self.pv = self.ifft(-(self.wv2i*self.qh)).real
-        self.p = self.pv+self.pw
-        self.ph = self.fft(self.p)
+            # invert for psi
+            self.pwh = self.wv2i*self.qwh
+            self.pvh = -self.wv2i*self.qh
+            self.ph = self.pvh+self.pwh
+            self.p =  self.ifft(self.ph).real
+            self.pv = self.ifft(self.pvh).real
+            self.pw = self.ifft(self.pwh).real
 
-        # calcuate q
-        self.q = self.ifft(self.qh).real
+            # calcuate q
+            self.q = self.ifft(self.qh).real
+        else:
+            self.phi2 = np.abs(self.phi)**2
+            self.gphi2h = -self.wv2*self.fft(self.phi2)
+            self.qwh = 0.5*(0.5*self.gphi2h  + self.jacobian_phic_phi())/self.f
+            self.qwh *= self.filtr
+
+            # invert for psi
+            self.pwh = self.wv2i*self.qwh
+            self.pvh = -self.wv2i*self.qh
+            self.ph = self.pvh+self.pwh
+            self.p =  self.ifft(self.ph).real
+            self.pv = self.ifft(self.pvh).real
+            self.pw = self.ifft(self.pwh).real
+
+            # calcuate q
+            self.q = self.ifft(self.qh).real
+
 
     def _calc_ke_qg_decomp(self):
 

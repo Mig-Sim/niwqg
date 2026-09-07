@@ -2,9 +2,9 @@ import numpy as np
 from numpy import pi
 import logging, os
 import h5py
-
 from .Diagnostics import *
 from .Saving import *
+import cupy as cp
 
 class Kernel(object):
 
@@ -52,6 +52,10 @@ class Kernel(object):
                 Viscosity for for near-inertial waves.
         muw: float (optional)
                 Linear drag for for near-inertial waves.
+        sigma_q: amplitude of the potential vorticity forcing.
+        wavenumber_forcing: wavenumber of the porntial vorticity forcing.
+        width_forcing: width of the potential vorticity forcing.
+        sigma_w: amplitude of the wave forcing.
         dealias: bool (optional)
                 If True, then dealias solution using 2/3 rule.
         save_to_disk: bool (optional)
@@ -84,10 +88,14 @@ class Kernel(object):
         g= 9.81,
         nu4=0,
         nu4w=0,
-        nu=20,
-        nuw=50.,
+        nu=0,
+        nuw=0.,
         mu=0,
         muw=0,
+        sigma_q = 0.,
+        sigma_w = 0.,
+        wavenumber_forcing = 25,
+        width_forcing = 2,
         dealias = False,
         save_to_disk=False,
         overwrite=True,
@@ -95,7 +103,8 @@ class Kernel(object):
         tdiags=10,
         path = 'output/',
         use_mkl=False,
-        nthreads=1):
+        nthreads=4,
+        use_cuda = False):
 
         self.nx = nx
         self.ny = nx
@@ -122,6 +131,11 @@ class Kernel(object):
         self.kappa2 = self.kappa**2
         self.cflmax = cflmax
 
+        self.sigma_w =  sigma_w
+        self.sigma_q =  sigma_q
+        self.wavenumber_forcing = wavenumber_forcing
+        self.width_forcing = width_forcing
+
         self.hslash = self.f/self.kappa2
 
         self.save_to_disk = save_to_disk
@@ -135,7 +149,9 @@ class Kernel(object):
 
         self.use_mkl = use_mkl
         self.nthreads = nthreads
+        self.use_cuda = use_cuda
 
+        
         self._initialize_logger()
         self.logger.info(self.model)
         self._initialize_grid()
@@ -143,6 +159,7 @@ class Kernel(object):
         self._initialize_filter()
         self._initialize_etdrk4()
         self._initialize_time()
+        self._initialize_forcing()
 
         initialize_save_snapshots(self,self.path)
         save_setup(self,)
@@ -172,7 +189,10 @@ class Kernel(object):
 
         """
 
-        tsnapints = np.ceil(tsnapint/self.dt)
+        if self.use_cuda:
+            tsnapints = cp.ceil(tsnapint/self.dt)
+        else:
+            tsnapints = np.ceil(tsnapint/self.dt)
 
         while(self.t < self.tmax):
             self._step_forward()
@@ -229,9 +249,15 @@ class Kernel(object):
         """ Create spatial and spectral grids and normalization constants.
         """
 
-        self.x,self.y = np.meshgrid(
-            np.arange(0.5,self.nx,1.)/self.nx*self.L,
-            np.arange(0.5,self.ny,1.)/self.ny*self.W )
+        if self.use_cuda:
+                self.x,self.y = cp.meshgrid(
+                cp.arange(0.5,self.nx,1.)/self.nx*self.L,
+                cp.arange(0.5,self.ny,1.)/self.ny*self.W )
+                
+        else:
+                self.x,self.y = np.meshgrid(
+                np.arange(0.5,self.nx,1.)/self.nx*self.L,
+                np.arange(0.5,self.ny,1.)/self.ny*self.W )
 
         self.dk = 2.*pi/self.L
         self.dl = 2.*pi/self.L
@@ -239,11 +265,17 @@ class Kernel(object):
         # wavenumber grids
         self.nl = self.ny
         self.nk = self.nl
-        self.ll = self.dl*np.append( np.arange(0.,self.nx/2),
-            np.arange(-self.nx/2,0.) )
-        self.kk = self.ll.copy()
+        if self.use_cuda:
+                self.ll = self.dl*cp.append( cp.arange(0.,self.nx/2),
+                        cp.arange(-self.nx/2,0.) )
+                self.kk = self.ll.copy()
+                self.k, self.l = cp.meshgrid(self.kk, self.ll)
+        else:
+                self.ll = self.dl*np.append( np.arange(0.,self.nx/2),
+                        np.arange(-self.nx/2,0.) )
+                self.kk = self.ll.copy()
+                self.k, self.l = np.meshgrid(self.kk, self.ll)
 
-        self.k, self.l = np.meshgrid(self.kk, self.ll)
         self.ik = 1j*self.k
         self.il = 1j*self.l
 
@@ -257,11 +289,17 @@ class Kernel(object):
         # isotropic wavenumber^2 grid
         # the inversion is not defined at kappa = 0
         self.wv2 = self.k**2 + self.l**2
-        self.wv = np.sqrt( self.wv2 )
+        if self.use_cuda:
+                self.wv = cp.sqrt( self.wv2 )
+        else:
+                self.wv = np.sqrt( self.wv2 )
         self.wv4 = self.wv2**2
 
         iwv2 = self.wv2 != 0.
-        self.wv2i = np.zeros_like(self.wv2)
+        if self.use_cuda:
+                self.wv2i = cp.zeros_like(self.wv2)
+        else:
+                self.wv2i = np.zeros_like(self.wv2)
         self.wv2i[iwv2] = self.wv2[iwv2]**-1
 
     def _initialize_filter(self):
@@ -270,23 +308,44 @@ class Kernel(object):
 
         if self.use_filter:
             cphi=0.65*pi
-            wvx=np.sqrt((self.k*self.dx)**2.+(self.l*self.dy)**2.)
-            self.filtr = np.exp(-23.6*(wvx-cphi)**4.)
-            self.filtr[wvx<=cphi] = 1.
-            self.logger.info(' Using filter')
+            if self.use_cuda:
+                wvx= cp.sqrt((self.k*self.dx)**2.+(self.l*self.dy)**2.)
+                self.filtr = cp.exp(-23.6*(wvx-cphi)**4.)
+                self.filtr[wvx<=cphi] = 1.
+                self.logger.info(' Using filter')
+            else:
+                wvx=np.sqrt((self.k*self.dx)**2.+(self.l*self.dy)**2.)
+                self.filtr = np.exp(-23.6*(wvx-cphi)**4.)
+                self.filtr[wvx<=cphi] = 1.
+                self.logger.info(' Using filter')
         elif self.dealias:
-            self.filtr = np.ones_like(self.wv2)
-            self.filtr[self.nx//3:2*self.nx//3,:] = 0.
-            self.filtr[:,self.ny//3:2*self.ny//3] = 0.
-            self.logger.info(' Dealiasing with 2/3 rule')
+            if self.use_cuda:
+                self.filtr = cp.ones_like(self.wv2)
+                self.filtr[self.nx//3:2*self.nx//3,:] = 0.
+                self.filtr[:,self.ny//3:2*self.ny//3] = 0.
+                self.logger.info(' Dealiasing with 2/3 rule')
+            else:
+                self.filtr = np.ones_like(self.wv2)
+                self.filtr[self.nx//3:2*self.nx//3,:] = 0.
+                self.filtr[:,self.ny//3:2*self.ny//3] = 0.
+                self.logger.info(' Dealiasing with 2/3 rule')
         else:
-            self.filtr = np.ones_like(self.wv2)
-            self.logger.info(' No dealiasing; no filter')
+            if self.use_cuda:
+                self.filtr = cp.ones_like(self.wv2)
+                self.logger.info(' No dealiasing; no filter')
+            else:
+                self.filtr = np.ones_like(self.wv2)
+                self.logger.info(' No dealiasing; no filter')
+
 
     def _initialize_logger(self):
 
         """ Initialize logger.
         """
+
+        if self.use_cuda:
+                global cp
+                import cupy as cp
 
         self.logger = logging.getLogger(__name__)
 
@@ -303,6 +362,64 @@ class Kernel(object):
         self.logger.propagate = False
         self.logger.info(' Logger initialized')
 
+    def _initialize_forcing(self):
+
+        """ Sets up the spectrum of the stochastic forcing """
+
+        # the spectrum of the forcing
+        if self.use_cuda:
+            self.spectrum_qg_forcing = cp.exp(-((self.wv-self.wavenumber_forcing)**2) / (2*(self.width_forcing**2)) )
+        else:
+            self.spectrum_qg_forcing = np.exp(-((self.wv-self.wavenumber_forcing)**2) / (2*(self.width_forcing**2)) )
+
+        # Normalize such that the equivalent kinetic energy spectrum integrates to one
+        if self.use_cuda:
+            norm = self.spec_var( cp.sqrt(self.spectrum_qg_forcing*self.wv2i/2) )
+        else:
+            norm = self.spec_var( np.sqrt(self.spectrum_qg_forcing*self.wv2i/2) )
+        self.spectrum_qg_forcing *= 1./norm
+
+    def _update_qg_forcing(self):
+
+        """ Updates the qg forcing (delta-correlated in time) """
+        if self.use_cuda:
+                phase = cp.random.rand(self.nl,self.nk)*2*cp.pi
+                fh = self.sigma_q*cp.sqrt(2*self.spectrum_qg_forcing)*cp.exp(1j*phase)
+                self.force = self.ifft(fh).real
+                return self.fft(self.force)
+        else:
+                phase = np.random.rand(self.nl,self.nk)*2*np.pi
+                fh = self.sigma_q*np.sqrt(2*self.spectrum_qg_forcing)*np.exp(1j*phase)
+                self.force = self.ifft(fh).real
+                return self.fft(self.force)
+
+    def _update_wave_forcing(self):
+
+        """ Updates the wave forcing (delta-correlated in time) """
+
+        #phase = np.random.rand(self.nl,self.nk)*2*np.pi
+        #fh = np.sqrt(self.epsilon_w*self.spectrum_wave_forcing)*np.exp(1j*phase)
+        #xi = np.ones_like(self.q)*(np.random.randn()+1j*np.random.randn())/np.sqrt(2)
+        #xi = np.ones_like(self.q)*(1. +1j) # force by a contant
+        #self.forcew = self.sigma_w*xi # the energy input is epsilon_w/2
+        if self.use_cuda:
+                xi = cp.ones_like(self.q)*(cp.random.randn()+1j*cp.random.randn())/cp.sqrt(2)
+                #xi = cp.ones_like(self.q)*(1. +1j) # force by a contant
+                self.forcew = self.sigma_w*xi # the energy input is epsilon_w/2
+                return self.fft(self.forcew)
+        else:
+                xi = np.ones_like(self.q)*(np.random.randn()+1j*np.random.randn())/np.sqrt(2)
+                #xi = np.ones_like(self.q)*(1. +1j) # force by a contant
+                self.forcew = self.sigma_w*xi # the energy input is epsilon_w/2
+                return self.fft(self.forcew)
+
+        #return np.sqrt(self.epsilon_w)*(np.random.randn()+1j*np.random.randn())#/np.sqrt(2)
+
+    def _update_niw_forcing(self):
+        """ Updates the forcing (delta-correlated in time) """
+        #phase = np.random.rand(self.nl,self.nk)*2*np.pi
+        #return self.amplitude_forcing*np.sqrt(self.spectrum_forcing)*np.exp(1j*phase)/np.sqrt(self.dt)
+        pass
 
     def _step_etdrk4(self):
 
@@ -316,56 +433,50 @@ class Kernel(object):
 
         """
 
-        self._calc_energy_conversion()
-        k1 = -(self.gamma1+self.gamma2) + (self.xi1+self.xi2) + self._calc_ep_psi()
-        p1 = self.gamma1+self.gamma2 + self._calc_chi_phi()
-        a1 = self._calc_ep_phi()
+        self.forceh = self._update_qg_forcing()
+        #self.qh += np.sqrt(self.dt)*self.forceh
 
-        # q-equation
-        self.qh0 = self.qh.copy()
-        Fn0 = -self.jacobian_psi_q()
-        self.qh = (self.expch_h*self.qh0 + Fn0*self.Qh)*self.filtr
-        self.qh1 = self.qh.copy()
-
-        # phi-equation
-        self.phih0 = self.phih.copy()
-        Fn0w = -self.jacobian_psi_phi() - 0.5j*self.fft(self.phi*self.q_psi)
-        self.phih = (self.expch_hw*self.phih0 + Fn0w*self.Qhw)*self.filtr
-        self.phih1 = self.phih.copy()
-
-        # q-equation
-        self.phi = self.ifft(self.phih)
-        self._invert()
-        self._calc_rel_vorticity()
+        self.forcewh = self._update_wave_forcing() # single random number
+        #self.phih += np.sqrt(self.dt)*self.forcewh
 
         self._calc_energy_conversion()
-        k2 = -(self.gamma1+self.gamma2) + (self.xi1+self.xi2) + self._calc_ep_psi()
-        p2 = self.gamma1+self.gamma2 + self._calc_chi_phi()
-        a2 = self._calc_ep_phi()
+        if self.use_cuda:
+                w1_q = -(self.p*self.force).mean()/cp.sqrt(self.dt)
+                w1_w =  (cp.conj(self.phi)*self.forcew).mean().real/cp.sqrt(self.dt)
+                k1 = -(self.gamma1+self.gamma2) + (self.xi1+self.xi2) + self._calc_ep_psi() + self._calc_smalldiss_psi() + w1_q
+                p1 = self.gamma1+self.gamma2 + self._calc_chi_phi() + self._calc_smallchi_phi()
+                a1 = self._calc_ep_phi()+ self._calc_smalldiss_phi() + w1_w
 
-        Fna = -self.jacobian_psi_q()
-        self.qh = (self.expch_h*self.qh0 + Fna*self.Qh)*self.filtr
-
-        # phi-equation
-        Fnaw = -self.jacobian_psi_phi() - 0.5j*self.fft(self.phi*self.q_psi)
-        self.phih = (self.expch_hw*self.phih0 + Fnaw*self.Qhw)*self.filtr
+        
+                w1_q = -(self.p*self.force).mean()/np.sqrt(self.dt)
+                w1_w =  (np.conj(self.phi)*self.forcew).mean().real/np.sqrt(self.dt)
+                k1 = -(self.gamma1+self.gamma2) + (self.xi1+self.xi2) + self._calc_ep_psi() + self._calc_smalldiss_psi() + w1_q
+                p1 = self.gamma1+self.gamma2 + self._calc_chi_phi() + self._calc_smallchi_phi()
+                a1 = self._calc_ep_phi()+ self._calc_smalldiss_phi() + w1_w
 
         # q-equation
-        self.phi = self.ifft(self.phih)
-        self._invert()
-        self._calc_rel_vorticity()
+        if self.use_cuda:
+                self.qh0 = self.qh.copy()
+                Fn0 = -self.jacobian_psi_q() + self.mu*self.wv2*self.ph + self.forceh/cp.sqrt(self.dt)
+                self.qh = (self.expch_h*self.qh0 + Fn0*self.Qh)*self.filtr
+                self.qh1 = self.qh.copy()
 
-        self._calc_energy_conversion()
-        k3 = -(self.gamma1+self.gamma2) + (self.xi1+self.xi2) + self._calc_ep_psi()
-        p3 = self.gamma1+self.gamma2 + self._calc_chi_phi()
-        a3 = self._calc_ep_phi()
+                # phi-equation
+                self.phih0 = self.phih.copy()
+                Fn0w = -self.jacobian_psi_phi() - 0.5j*self.fft(self.phi*self.q_psi) + self.forcewh/cp.sqrt(self.dt)
+                self.phih = (self.expch_hw*self.phih0 + Fn0w*self.Qhw)*self.filtr
+                self.phih1 = self.phih.copy()
+        else:
+                self.qh0 = self.qh.copy()
+                Fn0 = -self.jacobian_psi_q() + self.mu*self.wv2*self.ph + self.forceh/np.sqrt(self.dt)
+                self.qh = (self.expch_h*self.qh0 + Fn0*self.Qh)*self.filtr
+                self.qh1 = self.qh.copy()
 
-        Fnb = -self.jacobian_psi_q()
-        self.qh = (self.expch_h*self.qh1 + ( 2.*Fnb - Fn0 )*self.Qh)*self.filtr
-
-        # phi-equation
-        Fnbw = -self.jacobian_psi_phi() - 0.5j*self.fft(self.phi*self.q_psi)
-        self.phih = (self.expch_hw*self.phih1 + ( 2.*Fnbw - Fn0w )*self.Qhw)*self.filtr
+                # phi-equation
+                self.phih0 = self.phih.copy()
+                Fn0w = -self.jacobian_psi_phi() - 0.5j*self.fft(self.phi*self.q_psi) + self.forcewh/np.sqrt(self.dt)
+                self.phih = (self.expch_hw*self.phih0 + Fn0w*self.Qhw)*self.filtr
+                self.phih1 = self.phih.copy()   
 
         # q-equation
         self.phi = self.ifft(self.phih)
@@ -373,23 +484,104 @@ class Kernel(object):
         self._calc_rel_vorticity()
 
         self._calc_energy_conversion()
-        k4 = -(self.gamma1+self.gamma2) + (self.xi1+self.xi2) + self._calc_ep_psi()
-        p4 = self.gamma1+self.gamma2 + self._calc_chi_phi()
-        a4 = self._calc_ep_phi()
+        if self.use_cuda:
+                w2_q = -(self.p*self.force).mean()/cp.sqrt(self.dt)
+                w2_w =  (cp.conj(self.phi)*self.forcew).mean().real/cp.sqrt(self.dt)
+                k2 = -(self.gamma1+self.gamma2) + (self.xi1+self.xi2) + self._calc_ep_psi() + self._calc_smalldiss_psi() + w2_q
+                p2 = self.gamma1+self.gamma2 + self._calc_chi_phi() + self._calc_smallchi_phi()
+                a2 = self._calc_ep_phi() + self._calc_smalldiss_phi() + w2_w
+             
+        else:
+                w2_q = -(self.p*self.force).mean()/np.sqrt(self.dt)
+                w2_w =  (np.conj(self.phi)*self.forcew).mean().real/np.sqrt(self.dt)
+                k2 = -(self.gamma1+self.gamma2) + (self.xi1+self.xi2) + self._calc_ep_psi() + self._calc_smalldiss_psi() + w2_q
+                p2 = self.gamma1+self.gamma2 + self._calc_chi_phi() + self._calc_smallchi_phi()
+                a2 = self._calc_ep_phi() + self._calc_smalldiss_phi() + w2_w
+        if self.use_cuda:
+                Fna = -self.jacobian_psi_q() + self.mu*self.wv2*self.ph + self.forceh/cp.sqrt(self.dt)
+                self.qh = (self.expch_h*self.qh0 + Fna*self.Qh)*self.filtr
 
-        Fnc = -self.jacobian_psi_q()
+                # phi-equation
+                Fnaw = -self.jacobian_psi_phi() - 0.5j*self.fft(self.phi*self.q_psi) + self.forcewh/cp.sqrt(self.dt)
+                self.phih = (self.expch_hw*self.phih0 + Fnaw*self.Qhw)*self.filtr
+        else:
+                Fna = -self.jacobian_psi_q() + self.mu*self.wv2*self.ph + self.forceh/np.sqrt(self.dt)
+                self.qh = (self.expch_h*self.qh0 + Fna*self.Qh)*self.filtr
+
+                # phi-equation
+                Fnaw = -self.jacobian_psi_phi() - 0.5j*self.fft(self.phi*self.q_psi) + self.forcewh/np.sqrt(self.dt)
+                self.phih = (self.expch_hw*self.phih0 + Fnaw*self.Qhw)*self.filtr
+
+        # q-equation
+        self.phi = self.ifft(self.phih)
+        self._invert()
+        self._calc_rel_vorticity()
+
+        self._calc_energy_conversion()
+        if self.use_cuda:
+                w3_q = -(self.p*self.force).mean()/cp.sqrt(self.dt)
+                w3_w =  (cp.conj(self.phi)*self.forcew).mean().real/cp.sqrt(self.dt)
+                k3 = -(self.gamma1+self.gamma2) + (self.xi1+self.xi2) + self._calc_ep_psi()+ self._calc_smalldiss_psi() + w3_q
+                p3 = self.gamma1+self.gamma2 + self._calc_chi_phi() + self._calc_smallchi_phi()
+                a3 = self._calc_ep_phi()+ self._calc_smalldiss_phi() + w3_w
+                Fnb = -self.jacobian_psi_q() + self.mu*self.wv2*self.ph + self.forceh/cp.sqrt(self.dt)
+                self.qh = (self.expch_h*self.qh1 + ( 2.*Fnb - Fn0 )*self.Qh)*self.filtr
+                # phi-equation
+                Fnbw = -self.jacobian_psi_phi() - 0.5j*self.fft(self.phi*self.q_psi) + self.forcewh/cp.sqrt(self.dt)
+                self.phih = (self.expch_hw*self.phih1 + ( 2.*Fnbw - Fn0w )*self.Qhw)*self.filtr               
+        else:
+                w3_q = -(self.p*self.force).mean()/np.sqrt(self.dt)
+                w3_w =  (np.conj(self.phi)*self.forcew).mean().real/np.sqrt(self.dt)
+                k3 = -(self.gamma1+self.gamma2) + (self.xi1+self.xi2) + self._calc_ep_psi()+ self._calc_smalldiss_psi() + w3_q
+                p3 = self.gamma1+self.gamma2 + self._calc_chi_phi() + self._calc_smallchi_phi()
+                a3 = self._calc_ep_phi()+ self._calc_smalldiss_phi() + w3_w
+                Fnb = -self.jacobian_psi_q() + self.mu*self.wv2*self.ph + self.forceh/np.sqrt(self.dt)
+                self.qh = (self.expch_h*self.qh1 + ( 2.*Fnb - Fn0 )*self.Qh)*self.filtr
+                # phi-equation
+                Fnbw = -self.jacobian_psi_phi() - 0.5j*self.fft(self.phi*self.q_psi) + self.forcewh/np.sqrt(self.dt)
+                self.phih = (self.expch_hw*self.phih1 + ( 2.*Fnbw - Fn0w )*self.Qhw)*self.filtr
+
+        # q-equation
+        self.phi = self.ifft(self.phih)
+        self._invert()
+        self._calc_rel_vorticity()
+
+        self._calc_energy_conversion()
+        if self.use_cuda:
+                w4_q = -(self.p*self.force).mean()/cp.sqrt(self.dt)
+                w4_w =  (cp.conj(self.phi)*self.forcew).mean().real/cp.sqrt(self.dt)
+                k4 = -(self.gamma1+self.gamma2) + (self.xi1+self.xi2) + self._calc_ep_psi()+ self._calc_smalldiss_psi() + w4_q
+                p4 = self.gamma1+self.gamma2 + self._calc_chi_phi() + self._calc_smallchi_phi()
+                a4 = self._calc_ep_phi()+ self._calc_smalldiss_phi() + w4_w
+        else:
+                w4_q = -(self.p*self.force).mean()/np.sqrt(self.dt)
+                w4_w =  (np.conj(self.phi)*self.forcew).mean().real/np.sqrt(self.dt)
+                k4 = -(self.gamma1+self.gamma2) + (self.xi1+self.xi2) + self._calc_ep_psi()+ self._calc_smalldiss_psi() + w4_q
+                p4 = self.gamma1+self.gamma2 + self._calc_chi_phi() + self._calc_smallchi_phi()
+                a4 = self._calc_ep_phi()+ self._calc_smalldiss_phi() + w4_w
+        if self.use_cuda:
+                Fnc = -self.jacobian_psi_q() + self.mu*self.wv2*self.ph + self.forceh/cp.sqrt(self.dt)
+        else:
+                Fnc = -self.jacobian_psi_q() + self.mu*self.wv2*self.ph + self.forceh/np.sqrt(self.dt)
+
         self.qh = (self.expch*self.qh0 + Fn0*self.f0 +  2.*(Fna+Fnb)*self.fab\
                   + Fnc*self.fc)*self.filtr
 
         # phi-equation
-        Fncw = -self.jacobian_psi_phi() - 0.5j*self.fft(self.phi*self.q_psi)
-        self.phih = (self.expchw*self.phih0 + Fn0w*self.f0w +  2.*(Fnaw+Fnbw)*self.fabw\
-                  + Fncw*self.fcw)*self.filtr
-
+        if self.use_cuda:
+                Fncw = -self.jacobian_psi_phi() - 0.5j*self.fft(self.phi*self.q_psi) + self.forcewh/cp.sqrt(self.dt)
+                self.phih = (self.expchw*self.phih0 + Fn0w*self.f0w +  2.*(Fnaw+Fnbw)*self.fabw\
+                          + Fncw*self.fcw)*self.filtr
+        else:
+                Fncw = -self.jacobian_psi_phi() - 0.5j*self.fft(self.phi*self.q_psi) + self.forcewh/np.sqrt(self.dt)
+                self.phih = (self.expchw*self.phih0 + Fn0w*self.f0w +  2.*(Fnaw+Fnbw)*self.fabw\
+                          + Fncw*self.fcw)*self.filtr
 
         self.Ke += self.dt*(k1 + 2*(k2+k3) + k4)/6.
         self.Pw += self.dt*(p1 + 2*(p2+p3) + p4)/6.
         self.Kw += self.dt*(a1 + 2*(a2+a3) + a4)/6.
+        self.Work_q += self.dt*(w1_q + 2*(w2_q+w3_q) + w4_q)/6.
+        self.Work_w += self.dt*(w1_w + 2*(w2_w+w3_w) + w4_w)/6.
 
         # invert
         self.phi = self.ifft(self.phih)
@@ -414,44 +606,80 @@ class Kernel(object):
         #
 
         # the exponent for the linear part
-        self.c = np.zeros((self.nl,self.nk),self.dtype_cplx) - 1j*self.k*self.U
-        self.c += -self.nu4*self.wv4 - self.nu*self.wv2 - self.mu
-        ch = self.c*self.dt
-        self.expch = np.exp(ch)
-        self.expch_h = np.exp(ch/2.)
-        self.expch2 = np.exp(2.*ch)
-
-        M = 32    # number of points for line integral in the complex plane
-        rho = 1.  # radius for complex integration
-        r = rho*np.exp(2j*np.pi*((np.arange(1.,M+1))/M)) # roots for integral
-        LR = ch[...,np.newaxis] + r[np.newaxis,np.newaxis,...]
-        LR2 = LR*LR
-        LR3 = LR2*LR
-        self.Qh   =  self.dt*(((np.exp(LR/2.)-1.)/LR).mean(axis=-1))
-        self.f0  =  self.dt*( ( ( -4. - LR + ( np.exp(LR)*( 4. - 3.*LR + LR2 ) ) )/ LR3 ).mean(axis=-1) )
-        self.fab =  self.dt*( ( ( 2. + LR + np.exp(LR)*( -2. + LR ) )/ LR3 ).mean(axis=-1) )
-        self.fc  =  self.dt*( ( ( -4. -3.*LR - LR2 + np.exp(LR)*(4.-LR) )/ LR3 ).mean(axis=-1) )
-
-        #
-        # coefficients for phi-equation
-        #
-
-        # the exponent for the linear part
-        self.c = np.zeros((self.nl,self.nk),self.dtype_cplx)  -1j*self.k*self.U
-        self.c += -self.nu4w*self.wv4 - 0.5j*self.f*(self.wv2/self.kappa2)\
-                        - self.nuw*self.wv2 - self.muw
-        ch = self.c*self.dt
-        self.expchw = np.exp(ch)
-        self.expch_hw = np.exp(ch/2.)
-        self.expch2w = np.exp(2.*ch)
-
-        LR = ch[...,np.newaxis] + r[np.newaxis,np.newaxis,...]
-        LR2 = LR*LR
-        LR3 = LR2*LR
-        self.Qhw   =  self.dt*(((np.exp(LR/2.)-1.)/LR).mean(axis=-1))
-        self.f0w  =  self.dt*( ( ( -4. - LR + ( np.exp(LR)*( 4. - 3.*LR + LR2 ) ) )/ LR3 ).mean(axis=-1) )
-        self.fabw =  self.dt*( ( ( 2. + LR + np.exp(LR)*( -2. + LR ) )/ LR3 ).mean(axis=-1) )
-        self.fcw  =  self.dt*( ( ( -4. -3.*LR - LR2 + np.exp(LR)*(4.-LR) )/ LR3 ).mean(axis=-1) )
+        if self.use_cuda:
+                self.c = cp.zeros((self.nl,self.nk),self.dtype_cplx) - 1j*self.k*self.U
+                self.c += -self.nu4*self.wv4 - self.nu*self.wv2 - self.mu
+                ch = self.c*self.dt
+                self.expch = cp.exp(ch)
+                self.expch_h = cp.exp(ch/2.)
+                self.expch2 = cp.exp(2.*ch)
+                M = 32    # number of points for line integral in the complex plane
+                rho = 1.  # radius for complex integration
+                r = rho*cp.exp(2j*cp.pi*((cp.arange(1.,M+1))/M)) # roots for integral
+                LR = ch[...,cp.newaxis] + r[cp.newaxis,cp.newaxis,...]
+                LR2 = LR*LR
+                LR3 = LR2*LR
+                self.Qh   =  self.dt*(((cp.exp(LR/2.)-1.)/LR).mean(axis=-1))
+                self.f0  =  self.dt*( ( ( -4. - LR + ( cp.exp(LR)*( 4. - 3.*LR + LR2 ) ) )/ LR3 ).mean(axis=-1) )
+                self.fab =  self.dt*( ( ( 2. + LR + cp.exp(LR)*( -2. + LR ) )/ LR3 ).mean(axis=-1) )
+                self.fc  =  self.dt*( ( ( -4. -3.*LR - LR2 + cp.exp(LR)*(4.-LR) )/ LR3 ).mean(axis=-1) )
+                #
+                # coefficients for phi-equation
+                #
+        
+                # the exponent for the linear part
+                self.c = cp.zeros((self.nl,self.nk),self.dtype_cplx)  -1j*self.k*self.U
+                self.c += -self.nu4w*self.wv4 - 0.5j*self.f*(self.wv2/self.kappa2)\
+                                - self.nuw*self.wv2 - self.muw
+                ch = self.c*self.dt
+                self.expchw = cp.exp(ch)
+                self.expch_hw = cp.exp(ch/2.)
+                self.expch2w = cp.exp(2.*ch)
+        
+                LR = ch[...,cp.newaxis] + r[cp.newaxis,cp.newaxis,...]
+                LR2 = LR*LR
+                LR3 = LR2*LR
+                self.Qhw   =  self.dt*(((cp.exp(LR/2.)-1.)/LR).mean(axis=-1))
+                self.f0w  =  self.dt*( ( ( -4. - LR + ( cp.exp(LR)*( 4. - 3.*LR + LR2 ) ) )/ LR3 ).mean(axis=-1) )
+                self.fabw =  self.dt*( ( ( 2. + LR + cp.exp(LR)*( -2. + LR ) )/ LR3 ).mean(axis=-1) )
+                self.fcw  =  self.dt*( ( ( -4. -3.*LR - LR2 + cp.exp(LR)*(4.-LR) )/ LR3 ).mean(axis=-1) )
+        else:     
+                self.c = np.zeros((self.nl,self.nk),self.dtype_cplx) - 1j*self.k*self.U
+                self.c += -self.nu4*self.wv4 - self.nu*self.wv2 - self.mu
+                ch = self.c*self.dt
+                self.expch = np.exp(ch)
+                self.expch_h = np.exp(ch/2.)
+                self.expch2 = np.exp(2.*ch)
+                M = 32    # number of points for line integral in the complex plane
+                rho = 1.  # radius for complex integration
+                r = rho*np.exp(2j*np.pi*((np.arange(1.,M+1))/M)) # roots for integral
+                LR = ch[...,np.newaxis] + r[np.newaxis,np.newaxis,...]
+                LR2 = LR*LR
+                LR3 = LR2*LR
+                self.Qh   =  self.dt*(((np.exp(LR/2.)-1.)/LR).mean(axis=-1))
+                self.f0  =  self.dt*( ( ( -4. - LR + ( np.exp(LR)*( 4. - 3.*LR + LR2 ) ) )/ LR3 ).mean(axis=-1) )
+                self.fab =  self.dt*( ( ( 2. + LR + np.exp(LR)*( -2. + LR ) )/ LR3 ).mean(axis=-1) )
+                self.fc  =  self.dt*( ( ( -4. -3.*LR - LR2 + np.exp(LR)*(4.-LR) )/ LR3 ).mean(axis=-1) )
+                #
+                # coefficients for phi-equation
+                #
+        
+                # the exponent for the linear part
+                self.c = np.zeros((self.nl,self.nk),self.dtype_cplx)  -1j*self.k*self.U
+                self.c += -self.nu4w*self.wv4 - 0.5j*self.f*(self.wv2/self.kappa2)\
+                                - self.nuw*self.wv2 - self.muw
+                ch = self.c*self.dt
+                self.expchw = np.exp(ch)
+                self.expch_hw = np.exp(ch/2.)
+                self.expch2w = np.exp(2.*ch)
+        
+                LR = ch[...,np.newaxis] + r[np.newaxis,np.newaxis,...]
+                LR2 = LR*LR
+                LR3 = LR2*LR
+                self.Qhw   =  self.dt*(((np.exp(LR/2.)-1.)/LR).mean(axis=-1))
+                self.f0w  =  self.dt*( ( ( -4. - LR + ( np.exp(LR)*( 4. - 3.*LR + LR2 ) ) )/ LR3 ).mean(axis=-1) )
+                self.fabw =  self.dt*( ( ( 2. + LR + np.exp(LR)*( -2. + LR ) )/ LR3 ).mean(axis=-1) )
+                self.fcw  =  self.dt*( ( ( -4. -3.*LR - LR2 + np.exp(LR)*(4.-LR) )/ LR3 ).mean(axis=-1) )
 
 
     def jacobian_psi_phi(self):
@@ -532,7 +760,9 @@ class Kernel(object):
         self._invert()
         self._calc_rel_vorticity()
         self.u, self.v = self.ifft(-self.il*self.ph).real, self.ifft(self.ik*self.ph).real
-        self.Ke = self.ke = self._calc_ke_qg()
+        self.Ke = self._calc_ke_qg()
+        self.Work_q = 0.
+        self.Work_w = 0.
 
 
     def set_phi(self,phi):
@@ -561,6 +791,9 @@ class Kernel(object):
             import mkl_fft
             self.fft =  (lambda x : mkl_fft.fft2(x))
             self.ifft = (lambda x : mkl_fft.ifft2(x))
+        elif self.use_cuda:
+            self.fft =  (lambda x : cp.fft.fft2(x))
+            self.ifft = (lambda x : cp.fft.ifft2(x))
         else:
             self.fft =  (lambda x : np.fft.fft2(x))
             self.ifft = (lambda x : np.fft.ifft2(x))
@@ -603,20 +836,35 @@ class Kernel(object):
 
     def _calc_ke_niw(self):
         """ Compute near-inertial kinetic energy, Kw. """
-        return 0.5*(np.abs(self.phi)**2).mean()
+        if self.use_cuda:
+            return 0.5*(cp.abs(self.phi)**2).mean()
+        else:
+            return 0.5*(np.abs(self.phi)**2).mean()
 
     def _calc_pe_niw(self):
         """ Compute near-inertial potential energy, Pw. """
         self.phix, self.phiy = self.ifft(self.ik*self.phih),self.ifft(self.il*self.phih)
-        return 0.25*( np.abs(self.phix)**2 +  np.abs(self.phiy)**2 ).mean()/self.kappa2
+        if self.use_cuda:
+                self.phix, self.phiy = self.ifft(self.ik*self.phih),self.ifft(self.il*self.phih)
+                return 0.25*( cp.abs(self.phix)**2 +  cp.abs(self.phiy)**2 ).mean()/self.kappa2
+             
+        else:
+                self.phix, self.phiy = self.ifft(self.ik*self.phih),self.ifft(self.il*self.phih)
+                return 0.25*( np.abs(self.phix)**2 +  np.abs(self.phiy)**2 ).mean()/self.kappa2
+
 
     def _calc_conc(self):
         """ Compute the correlation, C, between near-inertial velocity variance and
             relative vorticity.
             A measure of wave concentration in cyclones of anticyclones.
         """
-        self.upsilon = np.abs(self.phi)**2 -  (np.abs(self.phi)**2).mean()
-        return (self.upsilon*self.q_psi).mean()/self.upsilon.std()/self.q_psi.std()
+        if self.use_cuda:
+            self.upsilon = cp.abs(self.phi)**2 -  (cp.abs(self.phi)**2).mean()
+            return (self.upsilon*self.q_psi).mean()/self.upsilon.std()/self.q_psi.std()
+        else:
+            self.upsilon = np.abs(self.phi)**2 -  (np.abs(self.phi)**2).mean()
+            return (self.upsilon*self.q_psi).mean()/self.upsilon.std()/self.q_psi.std()
+
 
     def _calc_skewness(self):
         """ Compute skewness of relative vorticity. """
@@ -627,33 +875,60 @@ class Kernel(object):
         return 0.5*(self.q**2).mean()
 
     def _calc_ep_phi(self):
-        """ Compute dissipation of Kw.  """
-        return -self.nu4w*(np.abs(self.lapphi)**2).mean()\
-                - self.nuw*(np.abs(self.phix)**2+np.abs(self.phiy)**2).mean()\
-                -self.muw*(np.abs(self.phi)**2).mean()
+        """ Compute dissipation of Kw due to linear damping.  """
+        if self.use_cuda:
+            return -self.muw*(cp.abs(self.phi)**2).mean()
+        else:
+            return -self.muw*(np.abs(self.phi)**2).mean()
+
+    def _calc_smalldiss_phi(self):
+        """ Compute dissipation of Kw due to small-scale dissipation  """
+        if self.use_cuda:
+            return -self.nu4w*(cp.abs(self.lapphi)**2).mean()\
+                 - self.nuw*(cp.abs(self.phix)**2+cp.abs(self.phiy)**2).mean()
+        else:
+            return -self.nu4w*(np.abs(self.lapphi)**2).mean()\
+                 - self.nuw*(np.abs(self.phix)**2+np.abs(self.phiy)**2).mean()
 
     def _calc_ep_psi(self):
-        """ Compute dissipation of QG KE. """
+        """ Compute dissipation of QG KE due to linear drag. """
+        return self.mu*(self.p*self.q).mean()
+
+    def _calc_smalldiss_psi(self):
+        """ Compute dissipation of QG KE due to small-scale dissipation """
         lap2psi = self.ifft(self.wv4*self.ph).real
         lapq = self.ifft(-self.wv2*self.qh).real
-        return self.nu4*(self.q*lap2psi).mean() - self.nu*(self.p*lapq).mean()\
-                + self.mu*(self.p*self.q).mean()
+        return self.nu4*(self.q*lap2psi).mean() - self.nu*(self.p*lapq).mean()
 
     def _calc_chi_q(self):
         """"  Compute dissipation of S. """
         return -self.nu4*self.spec_var(self.wv2*self.qh)
 
     def _calc_chi_phi(self):
-        """"  Compute dissipation of Pw. """
+        """"  Compute dissipation of Pw due to linear dissipation """
+        if self.use_cuda:
+            return -0.5*self.muw*(cp.abs(self.phix)**2 + cp.abs(self.phiy)**2).mean()/self.kappa2
+        else:
+            return -0.5*self.muw*(np.abs(self.phix)**2 + np.abs(self.phiy)**2).mean()/self.kappa2
+
+    def _calc_smallchi_phi(self):
+        """"  Compute dissipation of Pw due to small-scale dissipation. """
         lphix, lphiy = self.ifft(-self.ik*self.wv2*self.phih),\
                             self.ifft(-self.il*self.wv2*self.phih)
-        return -0.5*self.nu4w*(np.abs(lphix)**2 + np.abs(lphiy)**2).mean()/self.kappa2\
-                -0.5*self.nuw*(np.abs(self.lapphi)**2).mean()/self.kappa2\
-                -0.5*self.muw*(np.abs(self.phix)**2 + np.abs(self.phiy)**2).mean()/self.kappa2
+        if self.use_cuda:
+            return -0.5*self.nu4w*(cp.abs(lphix)**2 + cp.abs(lphiy)**2).mean()/self.kappa2\
+                    -0.5*self.nuw*(cp.abs(self.lapphi)**2).mean()/self.kappa2\
+                    
+        else:
+            return -0.5*self.nu4w*(np.abs(lphix)**2 + np.abs(lphiy)**2).mean()/self.kappa2\
+                    -0.5*self.nuw*(np.abs(self.lapphi)**2).mean()/self.kappa2\
 
     def spec_var(self, ph):
         """ Compute variance of a variable `p` from its Fourier transform `ph` """
-        var_dens = np.abs(ph)**2 / self.M**2
+        if self.use_cuda:
+                var_dens = cp.abs(ph)**2 / self.M**2
+        else:
+                var_dens = np.abs(ph)**2 / self.M**2
         var_dens[0,0] = 0.
         return var_dens.sum()
 
@@ -682,27 +957,47 @@ class Kernel(object):
         self._calc_rel_vorticity()
 
         J_psi_phi = self.u*self.phix+self.v*self.phiy
-        self.lapphi = np.fft.ifft2(-self.wv2*self.phih)
+        if self.use_cuda:
+            self.lapphi = cp.fft.ifft2(-self.wv2*self.phih)
+        else:
+            self.lapphi = np.fft.ifft2(-self.wv2*self.phih)
 
         # dissipative source of QG KE
         lap2phi = self.ifft(self.wv4*self.phih)
         diss_phi= -self.nu4w*lap2phi + self.nuw*self.lapphi - self.muw*self.phi
-        J_diss_phi = -(diss_phi*np.conj(J_psi_phi)).imag
-        L_diss_phi = 0.5*(diss_phi*np.conj(self.phi)).real*self.q_psi
+        if self.use_cuda:
+                J_diss_phi = -(diss_phi*cp.conj(J_psi_phi)).imag
+                L_diss_phi = 0.5*(diss_phi*cp.conj(self.phi)).real*self.q_psi             
+        else:
+                J_diss_phi = -(diss_phi*np.conj(J_psi_phi)).imag
+                L_diss_phi = 0.5*(diss_phi*np.conj(self.phi)).real*self.q_psi
 
         # div fluxes
-        divFw = 0.5*self.hslash*(np.conj(self.phi)*self.lapphi).imag
+        if self.use_cuda:
+            divFw = 0.5*self.hslash*(cp.conj(self.phi)*self.lapphi).imag
+        else:
+            divFw = 0.5*self.hslash*(np.conj(self.phi)*self.lapphi).imag
 
         # correlations
-        self.gamma1 = (0.5*self.q_psi*divFw).mean()/self.f
-        self.gamma2 = 0.5*self.hslash*((np.conj(self.lapphi)*J_psi_phi).real).mean()/self.f
-        self.xi1 = J_diss_phi.mean()/self.f
-        self.xi2 = L_diss_phi.mean()/self.f
-        self.pi = (0.5*self.phi.mean()*(self.q_psi*np.conj(self.phi)).mean()).imag
+        if self.use_cuda:
+                self.gamma1 = (0.5*self.q_psi*divFw).mean()/self.f
+                self.gamma2 = 0.5*self.hslash*((cp.conj(self.lapphi)*J_psi_phi).real).mean()/self.f
+                self.xi1 = J_diss_phi.mean()/self.f
+                self.xi2 = L_diss_phi.mean()/self.f
+                self.pi = (0.5*self.phi.mean()*(self.q_psi*cp.conj(self.phi)).mean()).imag
+        else:
+                self.gamma1 = (0.5*self.q_psi*divFw).mean()/self.f
+                self.gamma2 = 0.5*self.hslash*((np.conj(self.lapphi)*J_psi_phi).real).mean()/self.f
+                self.xi1 = J_diss_phi.mean()/self.f
+                self.xi2 = L_diss_phi.mean()/self.f
+                self.pi = (0.5*self.phi.mean()*(self.q_psi*np.conj(self.phi)).mean()).imag
 
     def _calc_icke_niw(self):
         self.ke_niw = self._calc_ke_niw()
-        self.cke_niw = 0.5*(np.abs(self.phi.mean())**2)
+        if self.use_cuda:
+            self.cke_niw = 0.5*(cp.abs(self.phi.mean())**2)
+        else:
+            self.cke_niw = 0.5*(np.abs(self.phi.mean())**2)
         self.ike_niw = self.ke_niw-self.cke_niw
 
     def _initialize_diagnostics(self):
@@ -746,6 +1041,20 @@ class Kernel(object):
                 function = (lambda self: self.Kw)
         )
 
+        add_diagnostic(self, 'Work_q',
+                description='Accumulated work into balanced field by stochastic forcing, from work equation',
+                units=r'm^2 s^{-2}',
+                types = 'scalar',
+                function = (lambda self: self.Work_q)
+        )
+
+        add_diagnostic(self, 'Work_w',
+                description='Accumulated work into wave field by stochastic forcing, from work equation',
+                units=r'm^2 s^{-2}',
+                types = 'scalar',
+                function = (lambda self: self.Work_w)
+        )
+
         add_diagnostic(self, 'ke_qg',
                 description='Quasigeostrophic Kinetic Energy',
                 units=r'm^2 s^{-2}',
@@ -761,6 +1070,19 @@ class Kernel(object):
                 function = (lambda self: 0.5*(self.q**2).mean())
         )
 
+        add_diagnostic(self,'energy_input',
+                description='Energy input by random forcing',
+                units=r'$m^2 s^{-3}$',
+                types = 'scalar',
+                function = (lambda self: -(self.p*self.force).mean()/np.sqrt(self.dt))
+        )
+
+        add_diagnostic(self,'wave_energy_input',
+                description='Energy input by random forcing',
+                units=r'$m^2 s^{-3}$',
+                types = 'scalar',
+                function = (lambda self: (np.conj(self.phi)*self.forcew).mean().real/np.sqrt(self.dt))
+        )
 
         add_diagnostic(self, 'ke_niw',
                 description='Near-inertial Kinetic Energy',
@@ -840,17 +1162,31 @@ class Kernel(object):
         )
 
         add_diagnostic(self, 'ep_phi',
-                description='The hyperviscous dissipation of NIW kinetic energy',
+                description='The dissipation of NIW kinetic energy due to linear damping',
                 units=r'$m^2 s^{-3}$',
                 types = 'scalar',
                 function = (lambda self: self._calc_ep_phi())
         )
 
+        add_diagnostic(self, 'smalldiss_phi',
+                description='The dissipation of NIW kinetic energy due to small-scale dissipation',
+                units=r'$m^2 s^{-3}$',
+                types = 'scalar',
+                function = (lambda self: self._calc_smalldiss_phi())
+        )
+
         add_diagnostic(self, 'ep_psi',
-                description='The hyperviscous dissipation of QG kinetic energy',
+                description='The dissipation QG kinetic energy due to linear bottom drag',
                 units=r'$m^2 s^{-3}$',
                 types = 'scalar',
                 function = (lambda self: self._calc_ep_psi())
+        )
+
+        add_diagnostic(self, 'smalldiss_psi',
+                description='The dissipation of QG kinetic energy due to small-scale dissipation',
+                units=r'$m^2 s^{-3}$',
+                types = 'scalar',
+                function = (lambda self: self._calc_smalldiss_psi())
         )
 
         add_diagnostic(self, 'chi_q',
@@ -861,10 +1197,17 @@ class Kernel(object):
         )
 
         add_diagnostic(self, 'chi_phi',
-                description='The hyperviscous dissipation of NIW potential energy',
+                description='The dissipation of NIW potential energy due to linear damping',
                 units=r'$s^{-3}$',
                 types = 'scalar',
                 function = (lambda self: self._calc_chi_phi())
+        )
+
+        add_diagnostic(self, 'smallchi_phi',
+                description='The small-scale dissipation of NIW potential energy',
+                units=r'$s^{-3}$',
+                types = 'scalar',
+                function = (lambda self: self._calc_smallchi_phi())
         )
 
     def _calc_derived_fields(self):
