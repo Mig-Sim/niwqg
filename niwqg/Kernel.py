@@ -447,7 +447,7 @@ class Kernel(object):
                 p1 = self.gamma1+self.gamma2 + self._calc_chi_phi() + self._calc_smallchi_phi()
                 a1 = self._calc_ep_phi()+ self._calc_smalldiss_phi() + w1_w
 
-        
+        else:
                 w1_q = -(self.p*self.force).mean()/np.sqrt(self.dt)
                 w1_w =  (np.conj(self.phi)*self.forcew).mean().real/np.sqrt(self.dt)
                 k1 = -(self.gamma1+self.gamma2) + (self.xi1+self.xi2) + self._calc_ep_psi() + self._calc_smalldiss_psi() + w1_q
